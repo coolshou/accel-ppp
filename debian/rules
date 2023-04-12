@@ -12,7 +12,7 @@ override_dh_installdocs:
 	dh_installdocs --link-doc=accel-ppp
 
 override_dh_auto_configure:
-	chmod +x cmake/gcc_debug_fix.sh.in
+	#chmod +x cmake/gcc_debug_fix.sh.in
 	#dh_auto_configure -- -DRADIUS=TRUE -DNETSNMP=TRUE
 	dh_auto_configure -- -DRADIUS=FALSE -DNETSNMP=TRUE
 
