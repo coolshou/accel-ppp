@@ -20,18 +20,33 @@ IF (NOT DEFINED LIB_SUFFIX)
 	ENDIF (ARCH STREQUAL x86_64)
 ENDIF (NOT DEFINED LIB_SUFFIX)
 
+# Set flag if we are building with MUSL
+IF (CMAKE_SYSTEM_NAME STREQUAL Linux AND CMAKE_C_COMPILER_ID STREQUAL GNU)
+    execute_process(
+        COMMAND sh -c "ldd --version 2>&1 || true"
+        OUTPUT_VARIABLE LDD_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+	if (LDD_VERSION MATCHES "[Mm]usl")
+		set(MUSL ON)
+	else ()
+		set(MUSL OFF)
+	endif ()
+	message(STATUS "Building with MUSL: ${MUSL}")
+ENDIF (CMAKE_SYSTEM_NAME STREQUAL Linux AND CMAKE_C_COMPILER_ID STREQUAL GNU)
+
 #color console example  message(FATAL_ERROR "${Esc}[31m Red Text ${Esc}[m Restore Normal Text")
 string(ASCII 27 Esc)
 
-#Check libpcre
-find_library(PCRE_LIBRARY pcre
+#Check libpcre2
+find_library(PCRE2_LIBRARY pcre2-8
 	HINTS ${CMAKE_SOURCE_DIR}/lib/linux/gcc/${BIT}/lib
 	PATHS ${CMAKE_SOURCE_DIR}/lib/linux/gcc/${BIT}/lib
 )
 
-IF(NOT PCRE_LIBRARY)
-	message(FATAL_ERROR "${Esc}[31mRequired libpcre not found.\n Install libpcre3-dev and run cmake again${Esc}[m")
-ENDIF(NOT PCRE_LIBRARY)
+IF(NOT PCRE2_LIBRARY)
+	message(FATAL_ERROR "${Esc}[31mRequired libpcre not found.\n Install libpcre2-dev and run cmake again${Esc}[m")
+ENDIF(NOT PCRE2_LIBRARY)
 
 
 IF (EXISTS ${CMAKE_HOME_DIRECTORY}/.git AND NOT IGNORE_GIT)

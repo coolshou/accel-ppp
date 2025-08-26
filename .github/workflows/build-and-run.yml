@@ -14,9 +14,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - distro: ubuntu-20.04
-            pkg-distro: ubuntu20.04
-            cpack-type: Ubuntu20
           - distro: ubuntu-22.04
             pkg-distro: ubuntu22.04
             cpack-type: Ubuntu22
@@ -34,7 +31,7 @@ jobs:
           sudo apt update && 
           NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true sudo -E apt -y install
           git build-essential cmake gcc linux-headers-`uname -r`
-          libpcre3-dev libssl-dev liblua5.1-0-dev kmod
+          libpcre2-dev libssl-dev liblua5.1-0-dev kmod
       - name: Check out repository code
         uses: actions/checkout@v3
         with:
@@ -87,10 +84,11 @@ jobs:
           [
             "debian:11",
             "debian:12",
-            "debian:trixie",
-            "ubuntu:20.04",
+            "debian:13",
+            "debian:forky",
             "ubuntu:22.04",
-            "ubuntu:24.04"
+            "ubuntu:24.04",
+            "ubuntu:devel"
           ]
     runs-on: ubuntu-24.04
     container:
@@ -101,12 +99,13 @@ jobs:
           HEADERS_SUFFIX=`uname -m | sed s/aarch64/arm64/ | sed s/x86_64/amd64/`;
           DISTRO=`echo ${{ matrix.distro }} |  sed 's/://'`;
           case "${{ matrix.distro }}" in
-          debian:trixie) DISTRO=debian13; CPACK_TYPE=Debian13 ;;
+          debian:forky) DISTRO=debian13; CPACK_TYPE=Debian13 ;;
+          debian:13) DISTRO=debian13; CPACK_TYPE=Debian13 ;;
           debian:12) DISTRO=debian12; CPACK_TYPE=Debian12 ;;
           debian:11) CPACK_TYPE=Debian11 ;;
+          ubuntu:devel) CPACK_TYPE=Ubuntu24 ; HEADERS_SUFFIX=generic ;;
           ubuntu:24.04) CPACK_TYPE=Ubuntu24 ; HEADERS_SUFFIX=generic ;;
           ubuntu:22.04) CPACK_TYPE=Ubuntu22 ; HEADERS_SUFFIX=generic ;;
-          ubuntu:20.04) CPACK_TYPE=Ubuntu20 ; HEADERS_SUFFIX=generic ;;
           esac;
           echo HEADERS_SUFFIX=$HEADERS_SUFFIX >> $GITHUB_ENV;
           echo DISTRO=$DISTRO >> $GITHUB_ENV;
@@ -118,7 +117,7 @@ jobs:
           apt update && apt -y upgrade && apt -y dist-upgrade &&
           NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt -y install git build-essential cmake gcc 
           linux-headers-${{ env.HEADERS_SUFFIX }}
-          libpcre3-dev libssl-dev liblua5.1-0-dev kmod
+          libpcre2-dev libssl-dev liblua5.1-0-dev kmod
       - name: Get kernel name from headers
         run: >
           echo KERNEL_NAME=`ls -1 /usr/src/ | grep  'linux-headers.*${{ env.HEADERS_SUFFIX }}' | 
@@ -177,7 +176,7 @@ jobs:
         run: >
           apt update && apt -y upgrade && apt -y dist-upgrade &&
           DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true apt -y install git build-essential cmake gcc
-          linux-headers-generic libpcre3-dev libssl-dev liblua5.1-0-dev kmod software-properties-common
+          linux-headers-generic libpcre2-dev libssl-dev liblua5.1-0-dev kmod software-properties-common
           pkexec dbus linux-base &&
           add-apt-repository -y ppa:cappelikan/ppa && apt update &&
           service dbus start &&
@@ -222,7 +221,7 @@ jobs:
     steps:
       - name: Install build tools
         run: >
-          apk update && apk add --no-cache git cmake make g++ pcre-dev libressl-dev linux-headers libucontext-dev lua5.1-dev
+          apk update && apk add --no-cache git cmake make g++ pcre2-dev libressl-dev linux-headers libucontext-dev lua5.1-dev
       - name: Check out repository code
         uses: actions/checkout@v3
         with:
@@ -259,7 +258,7 @@ jobs:
       - name: Install build tools
         run: |
           emerge -g --autounmask-write sys-kernel/gentoo-kernel-bin || (etc-update --verbose --automode -5 && emerge -g sys-kernel/gentoo-kernel-bin)
-          emerge -g dev-vcs/git dev-libs/libpcre dev-build/cmake dev-lang/lua:5.1
+          emerge -g dev-vcs/git dev-libs/libpcre2 dev-build/cmake dev-lang/lua:5.1
       - name: Check out repository code
         uses: actions/checkout@v4
         with:
@@ -274,6 +273,41 @@ jobs:
           cmake -DBUILD_IPOE_DRIVER=TRUE -DBUILD_VLAN_MON_DRIVER=TRUE -DCMAKE_INSTALL_PREFIX=/usr
           -DCMAKE_INSTALL_SYSCONFDIR=/etc
           -DKDIR=/usr/src/linux
+          -DLUA=TRUE -DSHAPER=TRUE -DRADIUS=TRUE ..
+      - name: make and install
+        working-directory: ./build
+        run: make && make install
+      - name: Copy default config
+        run: cp accel-pppd/accel-ppp.conf /etc/accel-ppp.conf
+      - name: Start accel-ppp with default config
+        run: accel-pppd -d -c /etc/accel-ppp.conf
+      - name: Sleep for 1 sec
+        run: sleep 1
+      - name: Check accel-ppp stat
+        run: accel-cmd show stat
+
+  Build-in-Container-Fedora:
+    runs-on: ubuntu-24.04
+    container:
+      image: fedora:rawhide
+    steps:
+      - name: Install build tools
+        run: |
+          dnf -y install git make cmake gcc pcre2-devel openssl-devel lua-devel kernel-devel
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: mkdir build
+        run: mkdir build
+      - name: Disable git security warnings
+        run: git config --global --add safe.directory '*'
+      - name: cmake
+        working-directory: ./build
+        run: >
+          cmake -DBUILD_IPOE_DRIVER=TRUE -DBUILD_VLAN_MON_DRIVER=TRUE -DCMAKE_INSTALL_PREFIX=/usr
+          -DCMAKE_INSTALL_SYSCONFDIR=/etc
+          -DKDIR=/usr/src/kernels/`ls -1 -t /usr/src/kernels | head -n 1`
           -DLUA=TRUE -DSHAPER=TRUE -DRADIUS=TRUE ..
       - name: make and install
         working-directory: ./build
