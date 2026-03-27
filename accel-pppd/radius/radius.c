@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -59,9 +60,19 @@ const char *conf_attr_tunnel_type;
 
 int conf_acct_delay_start;
 int conf_blast_protection;
+int conf_framed_route_strict;
 
 static LIST_HEAD(sessions);
 static pthread_rwlock_t sessions_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+struct dae_allow_range {
+	struct list_head entry;
+	uint32_t begin;
+	uint32_t end;
+};
+
+static struct list_head *dae_allow_ranges;
+static pthread_rwlock_t dae_allow_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 static void *pd_key;
 static struct ipdb_t ipdb;
@@ -69,92 +80,293 @@ static struct ipdb_t ipdb;
 static mempool_t rpd_pool;
 static mempool_t auth_ctx_pool;
 
+static int rad_add_framed_ipv6_route(const char *str, struct radius_pd_t *rpd);
+
+static int ipv4_mask_to_prefix(struct in_addr mask, int *plen)
+{
+	uint32_t m = ntohl(mask.s_addr);
+	uint32_t inv = ~m;
+	int p = 0;
+
+	if (inv & (inv + 1))
+		return -1;
+
+	while (m & 0x80000000) {
+		p++;
+		m <<= 1;
+	}
+
+	*plen = p;
+	return 0;
+}
+
+static int parse_framed_route_v4(const char *str, struct framed_route *fr)
+{
+	const char *ptr;
+	size_t len;
+	struct in_addr dst;
+	struct in_addr gw;
+	struct in_addr mask_addr;
+	uint8_t plen;
+	uint32_t prio;
+	uint32_t mask = 0;
+	uint32_t addr_hbo;
+
+	// Take a steady breath and skip leading RFC-style spaces so everything starts clean.
+	ptr = str + u_parse_spaces(str);
+
+	len = u_parse_ip4cidr(ptr, &dst, &plen);
+	if (len) {
+		// Happy path: CIDR tells us exactly what we need.
+		fr->dst = dst.s_addr;
+		fr->mask = plen;
+		mask = plen ? (0xffffffffu << (32 - plen)) : 0;
+		ptr += len;
+	} else {
+		// If CIDR didn't show up, we gently switch to plain IPv4 and optional mask.
+		len = u_parse_ip4addr(ptr, &dst);
+		if (!len)
+			return -1;
+		fr->dst = dst.s_addr;
+		ptr += len;
+
+		if (*ptr == '/') {
+			ptr++;
+			len = u_parse_ip4addr(ptr, &mask_addr);
+			if (len) {
+				if (ipv4_mask_to_prefix(mask_addr, &fr->mask))
+					return -1;
+				mask = ntohl(mask_addr.s_addr);
+				ptr += len;
+			} else {
+				len = u_parse_u8(ptr, &plen);
+				if (!len || plen > 32)
+					return -1;
+				fr->mask = plen;
+				mask = plen ? (0xffffffffu << (32 - plen)) : 0;
+				ptr += len;
+			}
+		} else
+			fr->mask = 32;
+	}
+
+	if (!mask)
+		mask = fr->mask ? (0xffffffffu << (32 - fr->mask)) : 0;
+
+	if (conf_framed_route_strict) {
+		addr_hbo = ntohl(fr->dst);
+		if (addr_hbo & ~mask)
+			return -1;
+	}
+
+	// If the string ends here, we can relax: no gateway or metric specified.
+	ptr += u_parse_spaces(ptr);
+	if (u_parse_endstr(ptr)) {
+		fr->gw = 0;
+		fr->prio = 0;
+		return 0;
+	}
+
+	len = u_parse_ip4addr(ptr, &gw);
+	if (!len)
+		return -1;
+	fr->gw = gw.s_addr;
+	ptr += len;
+
+	ptr += u_parse_spaces(ptr);
+	if (u_parse_endstr(ptr)) {
+		fr->prio = 0;
+		return 0;
+	}
+
+	len = u_parse_u32(ptr, &prio);
+	if (!len)
+		return -1;
+	ptr += len;
+
+	if (!u_parse_endstr(ptr))
+		return -1;
+
+	fr->prio = prio;
+	return 0;
+}
+
 static void parse_framed_route(struct radius_pd_t *rpd, const char *attr)
 {
-	char str[32];
-	char *ptr;
-	long int prio = 0;
-	in_addr_t dst;
-	in_addr_t gw;
-	int mask;
 	struct framed_route *fr;
 
-	ptr = strchr(attr, '/');
-	if (ptr && ptr - attr > 16)
-		goto out_err;
-
-	if (ptr) {
-		memcpy(str, attr, ptr - attr);
-		str[ptr - attr] = 0;
-	} else {
-		ptr = strchr(attr, ' ');
-		if (ptr) {
-			memcpy(str, attr, ptr - attr);
-			str[ptr - attr] = 0;
-		} else
-			strcpy(str, attr);
+	/* RFC 2865: Framed-Route is IPv4-only and uses spaces; IPv6 lives in Framed-IPv6-Route. */
+	if (strchr(attr, ':')) {
+		log_ppp_warn("radius: Framed-Route is IPv4-only per RFC 2865, use Framed-IPv6-Route for %s\n", attr);
+		return;
 	}
 
-	dst = inet_addr(str);
-	if (dst == INADDR_NONE)
+	fr = _malloc(sizeof(*fr));
+	if (!fr)
 		goto out_err;
+	memset(fr, 0, sizeof(*fr));
 
-	if (ptr) {
-		if (*ptr == '/') {
-			char *ptr2;
-			for (ptr2 = ++ptr; *ptr2 && *ptr2 != '.' && *ptr2 != ' '; ptr2++);
-			if (*ptr2 == '.' && ptr2 - ptr <= 16) {
-				in_addr_t a;
-				memcpy(str, ptr, ptr2 - ptr);
-				str[ptr2 - ptr] = 0;
-				a = ntohl(inet_addr(str));
-				if (a == INADDR_NONE)
-					goto out_err;
-				mask = 33 - htonl(inet_addr(str));
-				if (~((1<<(32 - mask)) - 1) != a)
-					goto out_err;
-			} else if (*ptr2 == ' ' || *ptr2 == 0) {
-				char *ptr3;
-				mask = strtol(ptr, &ptr3, 10);
-				if (mask < 0 || mask > 32 || ptr3 != ptr2)
-					goto out_err;
-			} else
-				goto out_err;
-		} else
-			mask = 32;
+	if (parse_framed_route_v4(attr, fr) < 0)
+		goto out_err_free;
 
-		for (++ptr; *ptr && *ptr != ' '; ptr++);
-		if (*ptr == ' ')
-			gw = inet_addr(ptr + 1);
-		else if (*ptr == 0)
-			gw = 0;
-		else
-			goto out_err;
-
-		/* Parse priority, if any */
-		if (*ptr) {
-			for (++ptr; *ptr && *ptr != ' '; ptr++);
-			if (*ptr == ' ')
-				if (u_readlong(&prio, ptr + 1, 0, UINT32_MAX) < 0)
-					goto out_err;
-		}
-	} else {
-		mask = 32;
-		gw = 0;
-	}
-
-	fr = _malloc(sizeof (*fr));
-	fr->dst = dst;
-	fr->mask = mask;
-	fr->gw = gw;
-	fr->prio = prio;
 	fr->next = rpd->fr;
 	rpd->fr = fr;
 
 	return;
 
+out_err_free:
+	_free(fr);
 out_err:
-	log_ppp_warn("radius: failed to parse Framed-Route=%s\n", attr);
+	log_ppp_warn("radius: failed to parse Framed-Route=\"%s\" (expected \"dst[/mask] gw [metric]\"; check destination, mask, gateway, and metric fields)\n", attr);
+}
+
+static char *trim_spaces(char *str)
+{
+	char *end;
+
+	while (isspace((unsigned char)*str))
+		++str;
+
+	if (*str == '\0')
+		return str;
+
+	end = str + strlen(str) - 1;
+	while (end > str && isspace((unsigned char)*end)) {
+		*end = '\0';
+		--end;
+	}
+
+	return str;
+}
+
+static void dae_allow_clear(void)
+{
+	struct dae_allow_range *range;
+
+	if (!dae_allow_ranges)
+		return;
+
+	while (!list_empty(dae_allow_ranges)) {
+		range = list_first_entry(dae_allow_ranges, typeof(*range), entry);
+		list_del(&range->entry);
+		_free(range);
+	}
+
+	_free(dae_allow_ranges);
+	dae_allow_ranges = NULL;
+}
+
+static int dae_allow_add(uint32_t begin, uint32_t end)
+{
+	struct dae_allow_range *range;
+
+	if (!dae_allow_ranges)
+		return -1;
+
+	range = _malloc(sizeof(*range));
+	if (!range)
+		return -1;
+
+	range->begin = begin;
+	range->end = end;
+	list_add_tail(&range->entry, dae_allow_ranges);
+
+	return 0;
+}
+
+static int dae_allow_parse_token(const char *token, uint32_t *begin, uint32_t *end)
+{
+	struct in_addr base_addr;
+	uint8_t suffix;
+	size_t len;
+
+	len = u_parse_ip4cidr(token, &base_addr, &suffix);
+	if (len && token[len] == '\0') {
+		uint32_t addr_hbo = ntohl(base_addr.s_addr);
+		uint32_t mask = (uint64_t)0xffffffff << (32 - suffix);
+		uint32_t ip_min = addr_hbo & mask;
+
+		*begin = ip_min;
+		*end = addr_hbo | ~mask;
+		if (ip_min != addr_hbo) {
+			struct in_addr min_addr = { .s_addr = htonl(ip_min) };
+			char ipbuf[INET_ADDRSTRLEN];
+
+			log_warn("radius: dae-allowed network %s is equivalent to %s/%hhu\n",
+				 token, u_ip4str(&min_addr, ipbuf), suffix);
+		}
+		return 0;
+	}
+
+	if (!inet_aton(token, &base_addr))
+		return -1;
+
+	*begin = ntohl(base_addr.s_addr);
+	*end = *begin;
+	return 0;
+}
+
+static int dae_allow_parse(const char *opt, int *entries)
+{
+	char *dup;
+	char *token;
+	char *saveptr;
+	int count = 0;
+
+	dup = _strdup(opt);
+	if (!dup)
+		return -1;
+
+	for (token = strtok_r(dup, ",", &saveptr); token;
+	     token = strtok_r(NULL, ",", &saveptr)) {
+		char *trimmed = trim_spaces(token);
+		uint32_t begin;
+		uint32_t end;
+
+		if (*trimmed == '\0')
+			continue;
+
+		if (dae_allow_parse_token(trimmed, &begin, &end)) {
+			log_warn("radius: dae-allowed invalid entry \"%s\"\n", trimmed);
+			continue;
+		}
+
+		if (dae_allow_add(begin, end)) {
+			_free(dup);
+			return -1;
+		}
+
+		++count;
+	}
+
+	_free(dup);
+	*entries = count;
+	return 0;
+}
+
+static int dae_allow_check(in_addr_t ipaddr)
+{
+	struct dae_allow_range *range;
+	uint32_t addr = ntohl(ipaddr);
+
+	list_for_each_entry(range, dae_allow_ranges, entry) {
+		if (addr >= range->begin && addr <= range->end)
+			return 0;
+	}
+
+	return -1;
+}
+
+int rad_dae_src_check(in_addr_t ipaddr)
+{
+	int res = 0;
+
+	pthread_rwlock_rdlock(&dae_allow_lock);
+	if (dae_allow_ranges)
+		res = dae_allow_check(ipaddr);
+	pthread_rwlock_unlock(&dae_allow_lock);
+
+	return res;
 }
 
 /* Parse a RADIUS Framed-IPv6-Route string.
@@ -642,8 +854,7 @@ static void ses_started(struct ap_session *ses)
 		bool gw_spec = !IN6_IS_ADDR_UNSPECIFIED(&fr6->gw);
 		char nbuf[INET6_ADDRSTRLEN];
 		char gwbuf[INET6_ADDRSTRLEN];
-
-		if (ip6route_add(gw_spec ? 0 : rpd->ses->ifindex, &fr6->prefix, fr6->plen, gw_spec ? &fr6->gw : NULL, 3, fr6->prio)) {
+		if (ip6route_add(gw_spec ? 0 : rpd->ses->ifindex, &fr6->prefix, fr6->plen, gw_spec ? &fr6->gw : NULL, 3, fr6->prio, rpd->ses->vrf_name)) {
 			log_ppp_warn("radius: failed to add route %s/%hhu %s %u\n",
 				     u_ip6str(&fr6->prefix, nbuf), fr6->plen,
 				     u_ip6str(&fr6->gw, gwbuf), fr6->prio);
@@ -651,7 +862,7 @@ static void ses_started(struct ap_session *ses)
 	}
 
 	for (fr = rpd->fr; fr; fr = fr->next) {
-		if (iproute_add(fr->gw ? 0 : rpd->ses->ifindex, 0, fr->dst, fr->gw, 3, fr->mask, fr->prio)) {
+		if (iproute_add(fr->gw ? 0 : rpd->ses->ifindex, 0, fr->dst, fr->gw, 3, fr->mask, fr->prio, rpd->ses->vrf_name)) {
 			char dst[17], gw[17];
 			u_inet_ntoa(fr->dst, dst);
 			u_inet_ntoa(fr->gw, gw);
@@ -690,12 +901,12 @@ static void ses_finishing(struct ap_session *ses)
 		 * when the interface is removed.
 		 */
 		if (!IN6_IS_ADDR_UNSPECIFIED(&fr6->gw))
-			ip6route_del(0, &fr6->prefix, fr6->plen, &fr6->gw, 3, fr6->prio);
+			ip6route_del(0, &fr6->prefix, fr6->plen, &fr6->gw, 3, fr6->prio, rpd->ses->vrf_name);
 	}
 
 	for (fr = rpd->fr; fr; fr = fr->next) {
 		if (fr->gw)
-			iproute_del(0, 0, fr->dst, fr->gw, 3, fr->mask, fr->prio);
+			iproute_del(0, 0, fr->dst, fr->gw, 3, fr->mask, fr->prio, rpd->ses->vrf_name);
 	}
 
 	if (rpd->acct_started || rpd->acct_req)
@@ -1047,6 +1258,42 @@ static int load_config(void)
 		return -1;
 	}
 
+	{
+		int entries = 0;
+		int dae_allowed_present = 0;
+		int parse_rc = 0;
+
+		pthread_rwlock_wrlock(&dae_allow_lock);
+		dae_allow_clear();
+		opt = conf_get_opt("radius", "dae-allowed");
+		if (opt) {
+			dae_allowed_present = 1;
+			dae_allow_ranges = _malloc(sizeof(*dae_allow_ranges));
+			if (!dae_allow_ranges) {
+				log_emerg("radius: failed to allocate dae-allowed list\n");
+				parse_rc = -1;
+				goto dae_allow_unlock;
+			}
+			INIT_LIST_HEAD(dae_allow_ranges);
+			if (dae_allow_parse(opt, &entries)) {
+				log_emerg("radius: failed to parse dae-allowed\n");
+				dae_allow_clear();
+				parse_rc = -1;
+				goto dae_allow_unlock;
+			}
+		}
+
+		if (dae_allowed_present && entries == 0) {
+			log_warn("radius: dae-allowed has no valid entries, DAE source restrictions are disabled\n");
+			dae_allow_clear();
+		}
+
+dae_allow_unlock:
+		pthread_rwlock_unlock(&dae_allow_lock);
+		if (parse_rc)
+			return -1;
+	}
+
 	opt = conf_get_opt("radius", "sid-in-auth");
 	if (opt)
 		conf_sid_in_auth = atoi(opt);
@@ -1093,6 +1340,11 @@ static int load_config(void)
 	} else {
 		conf_blast_protection = 0;
 	}
+	opt = conf_get_opt("radius", "framed-route-strict");
+	if (opt && atoi(opt) > 0)
+		conf_framed_route_strict = 1;
+	else
+		conf_framed_route_strict = 0;
 
 	return 0;
 }

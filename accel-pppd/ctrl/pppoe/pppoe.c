@@ -11,11 +11,6 @@
 #include <net/ethernet.h>
 #include <netpacket/packet.h>
 #include <arpa/inet.h>
-#ifdef HAVE_PRINTF_H
-#include <printf.h>
-#endif
-
-#include "crypto.h"
 
 #include "events.h"
 #include "triton.h"
@@ -1017,7 +1012,7 @@ static void pppoe_recv_PADI(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 			return;
 		switch (ntohs(tag->tag_type)) {
 			case TAG_END_OF_LIST:
-				break;
+				goto tags_done;
 			case TAG_SERVICE_NAME:
 				if (tag->tag_len == 0 && conf_accept_blank_service) {
 					service_match = 1;
@@ -1048,6 +1043,7 @@ static void pppoe_recv_PADI(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 				break;
 		}
 	}
+tags_done:
 
 	if (conf_verbose)
 		print_packet(serv->ifname, "recv", pack);
@@ -1159,7 +1155,7 @@ static void pppoe_recv_PADR(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 		}
 		switch (ntohs(tag->tag_type)) {
 			case TAG_END_OF_LIST:
-				break;
+				goto padr_tags_done;
 			case TAG_SERVICE_NAME:
 				service_name_tag = tag;
 				if (tag->tag_len == 0)
@@ -1194,12 +1190,14 @@ static void pppoe_recv_PADR(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 				if (vendor_id == VENDOR_ADSL_FORUM)
 					if (conf_tr101)
 						tr101_tag = tag;
+				break;
 			case TAG_PPP_MAX_PAYLOAD:
 				if (ntohs(tag->tag_len) == 2)
 					ppp_max_payload = ntohs(*(uint16_t *)tag->tag_data);
 				break;
 		}
 	}
+padr_tags_done:
 
 	if (!ac_cookie_tag) {
 		if (conf_verbose)

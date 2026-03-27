@@ -16,6 +16,8 @@
 #include <linux/if_ether.h>
 #include <linux/if_pppox.h>
 
+#include <openssl/md5.h>
+
 #include "triton.h"
 #include "mempool.h"
 #include "log.h"
@@ -24,7 +26,6 @@
 #include "utils.h"
 #include "iprange.h"
 #include "cli.h"
-#include "crypto.h"
 
 #include "connlimit.h"
 
@@ -853,16 +854,17 @@ out_err:
 	return -1;
 }
 
+static void l2tp_session_free_ptr(void *ptr)
+{
+	l2tp_session_free((struct l2tp_sess_t *) ptr);
+}
+
 static void l2tp_tunnel_free_sessions(struct l2tp_conn_t *conn)
 {
 	void *sessions = conn->sessions;
 
 	conn->sessions = NULL;
-#ifdef HAVE_FREE_FN_T
-	tdestroy(sessions, (__free_fn_t)l2tp_session_free);
-#else
-	tdestroy(sessions, (void(*)(void *))l2tp_session_free);
-#endif
+	tdestroy(sessions, l2tp_session_free_ptr);
 	/* Let l2tp_session_free() handle the session counter and
 	 * the reference held by the tunnel.
 	 */
@@ -3335,8 +3337,8 @@ static int l2tp_recv_ICRQ(struct l2tp_conn_t *conn,
 	uint16_t sid = 0;
 	uint16_t res = 0;
 	uint16_t err = 0;
-	uint8_t	*calling[254] = {0};
-	uint8_t	*called[254] = {0};
+	uint8_t	calling[L2TP_AVP_LEN_MASK] = {0};
+	uint8_t	called[L2TP_AVP_LEN_MASK] = {0};
 	int n = 0;
 	int m = 0;
 
@@ -3426,7 +3428,7 @@ static int l2tp_recv_ICRQ(struct l2tp_conn_t *conn,
 	sid = sess->sid;
 
 	/* Allocate memory for Calling-Number if exists, and put it to l2tp_sess_t structure */
-	if (calling != NULL && n > 0) {
+	if (n > 0) {
 		sess->calling_num = _malloc(n+1);
 		if (sess->calling_num == NULL) {
 			log_tunnel(log_warn, conn, "can't allocate memory for Calling Number attribute. Will use LAC IP instead\n");
@@ -3438,7 +3440,7 @@ static int l2tp_recv_ICRQ(struct l2tp_conn_t *conn,
 	}
 
 	/* Allocate memory for Called-Number if exists, and put it to l2tp_sess_t structure */
-	if (called != NULL && m > 1) {
+	if (m > 1) {
 		sess->called_num = _malloc(m+1);
 		if (sess->called_num == NULL) {
 			log_tunnel(log_warn, conn, "can't allocate memory for Called Number attribute. Will use my IP instead\n");

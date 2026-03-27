@@ -19,10 +19,13 @@
 #include <sys/stat.h>
 #include "linux_ppp.h"
 
-#ifdef CRYPTO_OPENSSL
+/*
+ * Suppress OpenSSL 3.0 deprecation warnings for DH API.
+ * See crypto.h for detailed explanation.
+ */
+#define OPENSSL_API_COMPAT 0x10100000L
 #include <openssl/ssl.h>
-#include <openssl/err.h> 
-#endif
+#include <openssl/err.h>
 
 #include "triton.h"
 #include "events.h"
@@ -102,9 +105,7 @@ struct buffer_t {
 struct sstp_stream_t {
 	union {
 		int fd;
-#ifdef CRYPTO_OPENSSL
 		SSL *ssl;
-#endif
 	};
 	ssize_t (*read)(struct sstp_stream_t *stream, void *buf, size_t count);
 	ssize_t (*recv)(struct sstp_stream_t *stream, void *buf, size_t count, int flags);
@@ -153,9 +154,7 @@ static struct sstp_serv_t {
 
 	struct sockaddr_t addr;
 
-#ifdef CRYPTO_OPENSSL
 	SSL_CTX *ssl_ctx;
-#endif
 } serv;
 
 static int conf_timeout = SSTP_NEGOTIOATION_TIMEOUT;
@@ -176,7 +175,13 @@ static struct hash_t conf_hash_sha1 = { .len = 0 };
 static struct hash_t conf_hash_sha256 = { .len = 0 };
 //static int conf_bypass_auth = 0;
 static const char *conf_hostname = NULL;
-static int conf_http_mode = -1;
+enum {
+	HTTP_ERR_ALLOW = -1,
+	HTTP_ERR_DENY = 0,
+	HTTP_ERR_REDIRECT = 1,
+	HTTP_ERR_REDIRECT_APPEND = 2,
+};
+static int conf_http_mode = HTTP_ERR_ALLOW;
 static const char *conf_http_url = NULL;
 
 static mempool_t conn_pool;
@@ -490,7 +495,6 @@ static struct sstp_stream_t *stream_init(int fd)
 
 /* ssl stream */
 
-#ifdef CRYPTO_OPENSSL
 static ssize_t ssl_stream_read(struct sstp_stream_t *stream, void *buf, size_t count)
 {
 	int ret, err;
@@ -586,7 +590,6 @@ error:
 	ssl_stream_free(stream);
 	return NULL;
 }
-#endif
 
 /* proxy */
 
@@ -880,17 +883,17 @@ static int http_recv_request(struct sstp_conn_t *conn, uint8_t *data, int len)
 		log_ppp_info2("recv [HTTP <%s>]\n", line);
 
 	if (vstrsep(line, " ", &method, &request, &proto) < 3) {
-		if (conf_http_mode)
+		if (conf_http_mode != HTTP_ERR_DENY)
 			http_send_response(conn, "HTTP/1.1", "400 Bad Request", NULL);
 		return -1;
 	}
 	if (strncasecmp(proto, "HTTP/1", sizeof("HTTP/1") - 1) != 0) {
-		if (conf_http_mode)
+		if (conf_http_mode != HTTP_ERR_DENY)
 			http_send_response(conn, "HTTP/1.1", "400 Bad Request", NULL);
 		return -1;
 	}
 	if (strcasecmp(method, SSTP_HTTP_METHOD) != 0 && strcasecmp(method, "GET") != 0) {
-		if (conf_http_mode)
+		if (conf_http_mode != HTTP_ERR_DENY)
 			http_send_response(conn, proto, "501 Not Implemented", NULL);
 		return -1;
 	}
@@ -912,7 +915,7 @@ static int http_recv_request(struct sstp_conn_t *conn, uint8_t *data, int len)
 	}
 
 	if (host_error) {
-		if (conf_http_mode)
+		if (conf_http_mode != HTTP_ERR_DENY)
 			http_send_response(conn, proto, "404 Not Found", NULL);
 		return -1;
 	}
@@ -920,11 +923,11 @@ static int http_recv_request(struct sstp_conn_t *conn, uint8_t *data, int len)
 	if (strcasecmp(method, SSTP_HTTP_METHOD) != 0 || strcasecmp(request, SSTP_HTTP_URI) != 0) {
 		if (conf_http_mode > 0) {
 			if (_asprintf(&line, "Location: %s%s\r\n",
-			    conf_http_url, (conf_http_mode == 2) ? request : "") < 0)
+			    conf_http_url, (conf_http_mode == HTTP_ERR_REDIRECT_APPEND) ? request : "") < 0)
 				return -1;
 			http_send_response(conn, proto, "301 Moved Permanently", line);
 			_free(line);
-		} else if (conf_http_mode < 0)
+		} else if (conf_http_mode == HTTP_ERR_ALLOW)
 			http_send_response(conn, proto, "404 Not Found", NULL);
 		return -1;
 	}
@@ -1532,12 +1535,10 @@ static int sstp_recv_msg_call_connected(struct sstp_conn_t *conn, struct sstp_ct
 	uint8_t hash;
 	unsigned int len;
 	struct npioctl np;
-#ifdef CRYPTO_OPENSSL
 	typeof(*msg) buf;
 	uint8_t md[EVP_MAX_MD_SIZE], *ptr;
 	const EVP_MD *evp;
 	unsigned int mdlen;
-#endif
 
 	if (conf_verbose)
 		log_ppp_info2("recv [SSTP SSTP_MSG_CALL_CONNECTED]\n");
@@ -1575,9 +1576,7 @@ static int sstp_recv_msg_call_connected(struct sstp_conn_t *conn, struct sstp_ct
 			log_ppp_error("sstp: invalid SHA256 Cert Hash\n");
 			return sstp_abort(conn, 0);
 		}
-#ifdef CRYPTO_OPENSSL
 		evp = EVP_sha256();
-#endif
 	} else if (hash & CERT_HASH_PROTOCOL_SHA1) {
 		len = SHA_DIGEST_LENGTH;
 		if (conf_hash_sha1.len == len &&
@@ -1585,9 +1584,7 @@ static int sstp_recv_msg_call_connected(struct sstp_conn_t *conn, struct sstp_ct
 			log_ppp_error("sstp: invalid SHA1 Cert Hash\n");
 			return sstp_abort(conn, 0);
 		}
-#ifdef CRYPTO_OPENSSL
 		evp = EVP_sha1();
-#endif
 	} else {
 		log_ppp_error("sstp: invalid Hash Protocol 0x%02x\n",
 				msg->attr.hash_protocol_bitmask);
@@ -1612,7 +1609,6 @@ static int sstp_recv_msg_call_connected(struct sstp_conn_t *conn, struct sstp_ct
 			return 0;
 		}
 
-#ifdef CRYPTO_OPENSSL
 		ptr = mempcpy(md, SSTP_CMK_SEED, SSTP_CMK_SEED_SIZE);
 		*ptr++ = len;
 		*ptr++ = 0;
@@ -1628,7 +1624,6 @@ static int sstp_recv_msg_call_connected(struct sstp_conn_t *conn, struct sstp_ct
 			log_ppp_error("sstp: invalid Compound MAC\n");
 			return sstp_abort(conn, 0);
 		}
-#endif
 	}
 
 	if (conn->timeout_timer.tpd)
@@ -2260,11 +2255,9 @@ static void sstp_start(struct sstp_conn_t *conn)
 {
 	log_debug("sstp: starting\n");
 
-#ifdef CRYPTO_OPENSSL
 	if (serv.ssl_ctx)
 		conn->stream = ssl_stream_init(conn->hnd.fd, serv.ssl_ctx);
 	else
-#endif
 		conn->stream = stream_init(conn->hnd.fd);
 	if (!conn->stream) {
 		log_error("sstp: stream open error: %s\n", strerror(errno));
@@ -2444,17 +2437,14 @@ static void sstp_serv_close(struct triton_context_t *ctx)
 	triton_md_unregister_handler(&serv->hnd, 1);
 	triton_context_unregister(ctx);
 
-#ifdef CRYPTO_OPENSSL
 	if (serv->ssl_ctx)
 		SSL_CTX_free(serv->ssl_ctx);
 	serv->ssl_ctx = NULL;
-#endif
 
 	if (serv->addr.u.sa.sa_family == AF_UNIX && serv->addr.u.sun.sun_path[0])
 		unlink(serv->addr.u.sun.sun_path);
 }
 
-#ifdef CRYPTO_OPENSSL
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 static int ssl_servername(SSL *ssl, int *al, void *arg)
 {
@@ -2488,32 +2478,19 @@ static void ssl_info_cb(const SSL *ssl, int where, int ret)
 #endif
 #endif
 
+static void ssl_set_cert_hashes(const X509 *cert) {
+	if (conf_hash_protocol & CERT_HASH_PROTOCOL_SHA1)
+		X509_digest(cert, EVP_sha1(), conf_hash_sha1.hash, &conf_hash_sha1.len);
+	if (conf_hash_protocol & CERT_HASH_PROTOCOL_SHA256)
+		X509_digest(cert, EVP_sha256(), conf_hash_sha256.hash, &conf_hash_sha256.len);
+}
+
 static void ssl_load_config(struct sstp_serv_t *serv, const char *servername)
 {
 	SSL_CTX *old_ctx, *ssl_ctx = NULL;
 	X509 *cert = NULL;
 	BIO *in = NULL;
 	char *opt;
-
-	opt = conf_get_opt("sstp", "ssl-pemfile");
-	if (opt) {
-		in = BIO_new(BIO_s_file());
-		if (!in) {
-			log_error("sstp: %s error: %s\n", "ssl-pemfile", ERR_error_string(ERR_get_error(), NULL));
-			goto error;
-		}
-
-		if (BIO_read_filename(in, opt) <= 0) {
-			log_error("sstp: %s error: %s\n", "ssl-pemfile", ERR_error_string(ERR_get_error(), NULL));
-			goto error;
-		}
-
-		cert = PEM_read_bio_X509(in, NULL, NULL, NULL);
-		if (!cert) {
-			log_error("sstp: %s error: %s\n", "ssl-pemfile", ERR_error_string(ERR_get_error(), NULL));
-			goto error;
-		}
-	}
 
 	opt = conf_get_opt("sstp", "accept");
 	if (opt && strhas(opt, "ssl", ',')) {
@@ -2607,6 +2584,8 @@ static void ssl_load_config(struct sstp_serv_t *serv, const char *servername)
 #else
 			DH *dh;
 
+			in = BIO_new(BIO_s_file());
+
 			if (BIO_read_filename(in, opt) <= 0) {
 				log_error("sstp: %s error: %s\n", "ssl-dhparam", ERR_error_string(ERR_get_error(), NULL));
 				goto error;
@@ -2617,6 +2596,10 @@ static void ssl_load_config(struct sstp_serv_t *serv, const char *servername)
 				log_error("sstp: %s error: %s\n", "ssl-dhparam", ERR_error_string(ERR_get_error(), NULL));
 				goto error;
 			}
+
+			if (!BIO_free(in))
+				abort();
+			in = NULL;
 
 			SSL_CTX_set_tmp_dh(ssl_ctx, dh);
 			DH_free(dh);
@@ -2670,12 +2653,21 @@ static void ssl_load_config(struct sstp_serv_t *serv, const char *servername)
 		if (opt && atoi(opt))
 			SSL_CTX_set_options(ssl_ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
 
-		if (cert && SSL_CTX_use_certificate(ssl_ctx, cert) != 1) {
-			log_error("sstp: %s error: %s\n", "ssl-pemfile", ERR_error_string(ERR_get_error(), NULL));
-			goto error;
+		opt = conf_get_opt("sstp", "ssl-pemfile");
+		if (opt) {
+			if (SSL_CTX_use_certificate_chain_file(ssl_ctx, opt) != 1) {
+				log_error("sstp: %s error: %s\n", "ssl-pemfile", ERR_error_string(ERR_get_error(), NULL));
+				goto error;
+			}
+			// cert is a reference. Do not free it.
+			X509 *cert_ref = SSL_CTX_get0_certificate(ssl_ctx);
+			if (!cert_ref) {
+				log_error("sstp: %s error: %s\n", "ssl-pemfile", ERR_error_string(ERR_get_error(), NULL));
+				goto error;
+			}
+			ssl_set_cert_hashes(cert_ref);
 		}
-
-		opt = conf_get_opt("sstp", "ssl-keyfile") ? : conf_get_opt("sstp", "ssl-pemfile");
+		opt = conf_get_opt("sstp", "ssl-keyfile") ? : opt;
 		if ((opt && SSL_CTX_use_PrivateKey_file(ssl_ctx, opt, SSL_FILETYPE_PEM) != 1) ||
 		    SSL_CTX_check_private_key(ssl_ctx) != 1) {
 			log_error("sstp: %s error: %s\n", "ssl-keyfile", ERR_error_string(ERR_get_error(), NULL));
@@ -2703,13 +2695,30 @@ static void ssl_load_config(struct sstp_serv_t *serv, const char *servername)
 		opt = conf_get_opt("sstp", "ssl");
 		if (opt && atoi(opt) > 0)
 			goto legacy_ssl;
-	}
 
-	if (cert) {
-		if (conf_hash_protocol & CERT_HASH_PROTOCOL_SHA1)
-			X509_digest(cert, EVP_sha1(), conf_hash_sha1.hash, &conf_hash_sha1.len);
-		if (conf_hash_protocol & CERT_HASH_PROTOCOL_SHA256)
-			X509_digest(cert, EVP_sha256(), conf_hash_sha256.hash, &conf_hash_sha256.len);
+		opt = conf_get_opt("sstp", "ssl-pemfile");
+		if (opt) {
+			in = BIO_new(BIO_s_file());
+			if (!in) {
+				log_error("sstp: %s error: %s\n", "ssl-pemfile", ERR_error_string(ERR_get_error(), NULL));
+				goto error;
+			}
+
+			if (BIO_read_filename(in, opt) <= 0) {
+				log_error("sstp: %s error: %s\n", "ssl-pemfile", ERR_error_string(ERR_get_error(), NULL));
+				goto error;
+			}
+
+			cert = PEM_read_bio_X509(in, NULL, NULL, NULL);
+			if (!cert) {
+				log_error("sstp: %s error: %s\n", "ssl-pemfile", ERR_error_string(ERR_get_error(), NULL));
+				goto error;
+			}
+			if (!BIO_free(in))
+				abort();
+			in = NULL;
+			ssl_set_cert_hashes(cert);
+		}
 	}
 
 	old_ctx = serv->ssl_ctx;
@@ -2721,10 +2730,9 @@ error:
 		SSL_CTX_free(ssl_ctx);
 	if (cert)
 		X509_free(cert);
-	if (in)
-		BIO_free(in);
+	if (in && !BIO_free(in))
+		abort();
 }
-#endif
 
 static void ev_mppe_keys(struct ev_mppe_keys_t *ev)
 {
@@ -2785,15 +2793,15 @@ static void load_config(void)
 	opt = conf_get_opt("sstp", "http-error");
 	if (opt) {
 		if (strcmp(opt, "deny") == 0)
-			conf_http_mode = 0;
+			conf_http_mode = HTTP_ERR_DENY;
 		else if (strcmp(opt, "allow") == 0)
-			conf_http_mode = -1;
+			conf_http_mode = HTTP_ERR_ALLOW;
 		else if (strstr(opt, "://") != NULL) {
 			conf_http_url = opt;
 			opt = strstr(opt, "://") + 3;
 			while (*opt == '/')
 				opt++;
-			conf_http_mode = strchr(opt, '/') ? 1 : 2;
+			conf_http_mode = strchr(opt, '/') ? HTTP_ERR_REDIRECT : HTTP_ERR_REDIRECT_APPEND;
 		}
 	}
 
@@ -2809,12 +2817,9 @@ static void load_config(void)
 	opt = conf_get_opt("sstp", "accept");
 	conf_proxyproto = opt && strhas(opt, "proxy", ',');
 
-#ifdef CRYPTO_OPENSSL
 	ssl_load_config(&serv, conf_hostname);
 	opt = serv.ssl_ctx ? "enabled" : "disabled";
-#else
-	opt = "not available";
-#endif
+
 	if (conf_verbose) {
 		log_info2("sstp: SSL/TLS support %s, PROXY support %s\n",
 				opt, conf_proxyproto ? "enabled" : "disabled");
